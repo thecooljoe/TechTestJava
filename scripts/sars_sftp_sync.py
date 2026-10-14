@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import os
+import re
 import shutil
 import stat
 import sys
@@ -284,10 +285,17 @@ def download_inbound(sftp: paramiko.SFTPClient, local_dir: Path, skip_existing: 
     return downloaded
 
 
-def summarise_psv(path: Path) -> bool:
+ID_NUMBER_RE = re.compile(r"^\d{13}$")
+NULLISH = {"", "NULL", "null", "None"}
+
+
+def summarise_psv(path: Path, repair_to: Path | None = None) -> bool:
     """Stream a pipe-separated file and print a summary. Returns True if it looks sane.
 
     Works line by line so multi-gigabyte files do not need to fit in memory.
+    Recognises a record that was split over two lines by a line break inside a
+    field (the two short lines together have exactly the usual column count) and,
+    with ``repair_to``, writes a copy with such records joined by a space.
     """
     size = path.stat().st_size
     total = 0
@@ -298,6 +306,18 @@ def summarise_psv(path: Path) -> bool:
     last_line = ""
     last_cols = 0
     decode_errors = 0
+    header_cols = 0
+    header: list[str] = []
+    id_col = -1
+    bad_ids: list[tuple[int, str]] = []
+    bad_id_count = 0
+    splits: list[tuple[int, str]] = []
+    pending: tuple[int, str, int] | None = None  # (lineno, text, cols) of a short line awaiting its tail
+    out = open(repair_to, "w", encoding="utf-8", newline="\n") if repair_to else None
+
+    def emit(text: str) -> None:
+        if out is not None:
+            out.write(text + "\n")
 
     with open(path, "rb") as fh:
         for raw in fh:
@@ -310,14 +330,49 @@ def summarise_psv(path: Path) -> bool:
             if total <= PREVIEW_LINES:
                 preview.append(ln)
             if not ln.strip():
+                emit(ln)
                 continue
             non_empty += 1
             cols = ln.count("|") + 1
+            record_line = total
+            if total == 1:
+                header_cols = cols
+                header = ln.split("|")
+                id_col = next((i for i, h in enumerate(header) if h.strip().lower() == "id number"), -1)
+            # Join a short line with the previous short line when together they form one record.
+            if pending is not None and header_cols and cols < header_cols \
+                    and pending[2] + cols - 1 == header_cols:
+                joined = pending[1] + " " + ln
+                splits.append((pending[0], joined))
+                record_line = pending[0]
+                col_hist[pending[2]] -= 1
+                if col_hist[pending[2]] == 0:
+                    del col_hist[pending[2]]
+                examples[pending[2]] = [e for e in examples.get(pending[2], []) if e[0] != pending[0]]
+                pending = None
+                ln, cols = joined, header_cols
+            else:
+                pending = None
             col_hist[cols] = col_hist.get(cols, 0) + 1
             examples.setdefault(cols, [])
             if len(examples[cols]) < 3:
                 examples[cols].append((total, ln))
+            if header_cols and cols < header_cols:
+                pending = (total, ln, cols)
+                continue  # do not emit yet; it may be the head of a split record
+            if id_col >= 0 and total > 1 and cols == header_cols:
+                value = ln.split("|")[id_col].strip()
+                if value not in NULLISH and not ID_NUMBER_RE.match(value):
+                    bad_id_count += 1
+                    if len(bad_ids) < 3:
+                        bad_ids.append((record_line, value))
+            emit(ln)
             last_line, last_cols = ln, cols
+        if pending is not None:
+            emit(pending[1])
+            last_line, last_cols = pending[1], pending[2]
+    if out is not None:
+        out.close()
 
     def clip(text: str) -> str:
         return text if len(text) <= 160 else text[:157] + "..."
@@ -342,8 +397,13 @@ def summarise_psv(path: Path) -> bool:
     notes = []
     if size == 0:
         problems.append("file is empty")
-    if non_empty and not col_hist.get(2) and max(col_hist, default=1) == 1:
+    if non_empty and max(col_hist, default=1) == 1:
         problems.append("no pipe delimiters found")
+    if splits:
+        problems.append(f"{len(splits)} record(s) split over two lines by a line break inside a field")
+        print(f"  split records ({len(splits)}); joined they read:")
+        for lineno, joined in splits[:3]:
+            print(f"    line {lineno:,}: {clip(joined)}")
     if len(col_hist) > 1:
         main_cols = max(col_hist, key=col_hist.get)
         odd = {c: n for c, n in col_hist.items() if c != main_cols}
@@ -357,10 +417,17 @@ def summarise_psv(path: Path) -> bool:
                 print(f"  rows with {c} columns ({n:,}); first examples:")
                 for lineno, ln in examples[c]:
                     print(f"    line {lineno:,}: {clip(ln)}")
+    if bad_id_count:
+        problems.append(f"{bad_id_count:,} ID Number value(s) are not 13 digits")
+        print(f"  ID Number values that are not 13 digits ({bad_id_count:,}); first examples:")
+        for lineno, value in bad_ids:
+            print(f"    line {lineno:,}: {value!r}")
     if decode_errors:
         problems.append("some lines are not valid UTF-8")
     for n in notes:
         print(f"  note:        {n}")
+    if repair_to:
+        print(f"  repaired copy written to {repair_to} (split records joined; original untouched)")
     if problems:
         print("  checks:      " + "; ".join(problems))
         return False
@@ -492,6 +559,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Print the SSH negotiation (paramiko debug log) to stderr")
     parser.add_argument("--inspect", nargs="+", type=Path, default=[], metavar="FILE",
                         help="Only summarise these already-downloaded .psv files; do not connect")
+    parser.add_argument("--repair", action="store_true",
+                        help="With --inspect: also write <name>.repaired.psv with split records joined")
     parser.add_argument("--skip-existing", action="store_true",
                         help="Do not re-download a file that already exists locally with the listed size")
     args = parser.parse_args(argv)
@@ -509,7 +578,8 @@ def main(argv: list[str] | None = None) -> int:
         for p in args.inspect:
             if not p.is_file():
                 sys.exit(f"'{p}' is not a file.")
-            ok = summarise_psv(p) and ok
+            target = p.with_name(p.stem + ".repaired" + p.suffix) if args.repair else None
+            ok = summarise_psv(p, target) and ok
         return 0 if ok else 1
     if args.verbose:
         import logging

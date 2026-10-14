@@ -6,7 +6,9 @@
 2. Downloads the `UIF_1_*.psv` files from `SARSOUTBOUND` (warns if there are not exactly two)
    and prints a content summary (size, line count, column-count distribution, preview, last line) for you
    to confirm. Files are streamed, so multi-gigabyte files are fine. A single short last line is
-   reported as a trailer record; other rows with the wrong column count are listed with line numbers.
+   reported as a trailer record; two adjacent short lines that together make one record are reported
+   as a record split by a line break inside a field; other rows with the wrong column count are listed
+   with line numbers. ID Number values that are not 13 digits are counted and listed.
 3. Deletes files in `SARSOUTBOUND` older than 31 days (asks before deleting; `--dry-run` only reports).
 4. Uploads any `--upload FILE ...` to the root directory, which is where files destined for SARS go.
 
@@ -35,6 +37,9 @@ python3 scripts/sars_sftp_sync.py --dry-run --upload UIF_2_20261014.psv
 
 # Re-check files you already downloaded, without connecting
 python3 scripts/sars_sftp_sync.py --inspect downloads/SARSOUTBOUND/*.psv
+
+# Same, and also write <name>.repaired.psv with records that were split by an embedded line break joined
+python3 scripts/sars_sftp_sync.py --inspect downloads/SARSOUTBOUND/*.psv --repair
 
 # Re-run without downloading files that are already present locally
 python3 scripts/sars_sftp_sync.py --skip-existing
