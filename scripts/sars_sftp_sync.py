@@ -36,7 +36,7 @@ from pathlib import Path
 try:
     import paramiko
 except ImportError:  # pragma: no cover - guidance for the operator
-    sys.exit("paramiko is required: pip install paramiko")
+    sys.exit("paramiko is required: pip install 'paramiko>=3.4,<4'")
 
 
 OUTBOUND_DIR = "SARSOUTBOUND"
@@ -336,6 +336,13 @@ def main(argv: list[str] | None = None) -> int:
                                args.strict_host_key, args.timeout)
     except paramiko.AuthenticationException:
         print("Authentication failed: check the username and password.", file=sys.stderr)
+        return 2
+    except paramiko.ssh_exception.IncompatiblePeer as exc:
+        print(f"Could not connect to {args.host}:{args.port}: {exc}", file=sys.stderr)
+        print("The server only offers SSH algorithms that this paramiko version "
+              f"({paramiko.__version__}) does not support. paramiko 4 and later dropped the "
+              "legacy ssh-rsa (SHA-1) and ssh-dss host keys that the SARS server uses.\n"
+              "Fix: pip install 'paramiko>=3.4,<4'", file=sys.stderr)
         return 2
     except (paramiko.SSHException, OSError) as exc:
         print(f"Could not connect to {args.host}:{args.port}: {exc}", file=sys.stderr)

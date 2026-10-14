@@ -14,6 +14,11 @@
 pip install -r scripts/requirements.txt
 ```
 
+paramiko is pinned below version 4 on purpose. The SARS SFTP server offers only legacy
+host-key algorithms (`ssh-rsa` with SHA-1 / `ssh-dss`) that paramiko 4 and later removed;
+with a newer paramiko the connection fails with `Incompatible ssh peer (no acceptable host key)`.
+If you already have a newer version installed, run `pip install 'paramiko>=3.4,<4'`.
+
 ## Usage
 
 ```bash
