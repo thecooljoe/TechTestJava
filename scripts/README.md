@@ -4,7 +4,9 @@
 
 1. Prompts for a username and password.
 2. Downloads the `UIF_1_*.psv` files from `SARSOUTBOUND` (warns if there are not exactly two)
-   and prints a content summary (size, encoding, line/column counts, preview) for you to confirm.
+   and prints a content summary (size, line count, column-count distribution, preview, last line) for you
+   to confirm. Files are streamed, so multi-gigabyte files are fine. A single short last line is
+   reported as a trailer record; other rows with the wrong column count are listed with line numbers.
 3. Deletes files in `SARSOUTBOUND` older than 31 days (asks before deleting; `--dry-run` only reports).
 4. Uploads any `--upload FILE ...` to the root directory, which is where files destined for SARS go.
 
@@ -30,6 +32,12 @@ python3 scripts/sars_sftp_sync.py --host sftp.sars.gov.za
 
 # Preview the clean-up and upload without changing the server
 python3 scripts/sars_sftp_sync.py --dry-run --upload UIF_2_20261014.psv
+
+# Re-check files you already downloaded, without connecting
+python3 scripts/sars_sftp_sync.py --inspect downloads/SARSOUTBOUND/*.psv
+
+# Re-run without downloading files that are already present locally
+python3 scripts/sars_sftp_sync.py --skip-existing
 
 # Unattended run (no confirmation prompts)
 python3 scripts/sars_sftp_sync.py --username <user> --yes

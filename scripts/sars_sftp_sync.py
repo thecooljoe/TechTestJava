@@ -26,6 +26,7 @@ Examples:
   python3 sars_sftp_sync.py --host sftp.sars.gov.za           # production
   python3 sars_sftp_sync.py --dry-run --upload UIF_2_20261014.psv
   python3 sars_sftp_sync.py --verbose                         # debug a login problem
+  python3 sars_sftp_sync.py --inspect downloads/SARSOUTBOUND/*.psv   # re-check local files offline
 """
 
 from __future__ import annotations
@@ -245,7 +246,7 @@ def download_file(sftp: paramiko.SFTPClient, directory: str, f: RemoteFile, loca
 # --------------------------------------------------------------------------- #
 # Step 2: download and verify UIF_1_*.psv
 # --------------------------------------------------------------------------- #
-def download_inbound(sftp: paramiko.SFTPClient, local_dir: Path) -> list[Path]:
+def download_inbound(sftp: paramiko.SFTPClient, local_dir: Path, skip_existing: bool = False) -> list[Path]:
     local_dir.mkdir(parents=True, exist_ok=True)
     all_files = list_remote_files(sftp, OUTBOUND_DIR)
 
@@ -266,6 +267,11 @@ def download_inbound(sftp: paramiko.SFTPClient, local_dir: Path) -> list[Path]:
     print(f"\nDownloading {len(wanted)} file(s) to {local_dir.resolve()} ...")
     for f in wanted:
         local_path = local_dir / f.name
+        if skip_existing and local_path.is_file() and local_path.stat().st_size > 0 \
+                and (f.size is None or local_path.stat().st_size == f.size):
+            print(f"  {f.name}: already downloaded ({local_path.stat().st_size:,} B), skipped")
+            downloaded.append(local_path)
+            continue
         used = download_file(sftp, OUTBOUND_DIR, f, local_path)
         local_size = local_path.stat().st_size
         note = ""
@@ -279,39 +285,82 @@ def download_inbound(sftp: paramiko.SFTPClient, local_dir: Path) -> list[Path]:
 
 
 def summarise_psv(path: Path) -> bool:
-    """Print a summary of a pipe-separated file. Returns True if it looks sane."""
-    raw = path.read_bytes()
-    try:
-        text = raw.decode("utf-8-sig")
-        encoding = "utf-8"
-    except UnicodeDecodeError:
-        text = raw.decode("latin-1")
-        encoding = "latin-1 (not valid UTF-8)"
+    """Stream a pipe-separated file and print a summary. Returns True if it looks sane.
 
-    lines = text.splitlines()
-    non_empty = [ln for ln in lines if ln.strip()]
-    col_counts = sorted({ln.count("|") + 1 for ln in non_empty})
+    Works line by line so multi-gigabyte files do not need to fit in memory.
+    """
+    size = path.stat().st_size
+    total = 0
+    non_empty = 0
+    col_hist: dict[int, int] = {}
+    examples: dict[int, list[tuple[int, str]]] = {}
+    preview: list[str] = []
+    last_line = ""
+    last_cols = 0
+    decode_errors = 0
+
+    with open(path, "rb") as fh:
+        for raw in fh:
+            total += 1
+            try:
+                ln = raw.decode("utf-8-sig" if total == 1 else "utf-8").rstrip("\r\n")
+            except UnicodeDecodeError:
+                decode_errors += 1
+                ln = raw.decode("latin-1").rstrip("\r\n")
+            if total <= PREVIEW_LINES:
+                preview.append(ln)
+            if not ln.strip():
+                continue
+            non_empty += 1
+            cols = ln.count("|") + 1
+            col_hist[cols] = col_hist.get(cols, 0) + 1
+            examples.setdefault(cols, [])
+            if len(examples[cols]) < 3:
+                examples[cols].append((total, ln))
+            last_line, last_cols = ln, cols
+
+    def clip(text: str) -> str:
+        return text if len(text) <= 160 else text[:157] + "..."
 
     print(f"\n=== {path.name} ===")
-    print(f"  size:        {len(raw):,} bytes")
-    print(f"  encoding:    {encoding}")
-    print(f"  lines:       {len(lines)} ({len(non_empty)} non-empty)")
-    print(f"  columns:     {col_counts if col_counts else 'n/a'}"
-          + ("  <- inconsistent column counts" if len(col_counts) > 1 else ""))
+    print(f"  size:        {size:,} bytes")
+    print(f"  encoding:    utf-8" + (f" ({decode_errors} line(s) not valid UTF-8)" if decode_errors else ""))
+    print(f"  lines:       {total:,} ({non_empty:,} non-empty)")
+    if col_hist:
+        dist = ", ".join(f"{c} cols x {n:,}" for c, n in sorted(col_hist.items(), key=lambda kv: -kv[1]))
+        print(f"  columns:     {dist}")
+    else:
+        print("  columns:     n/a")
     print(f"  preview (first {PREVIEW_LINES} lines):")
-    for ln in lines[:PREVIEW_LINES]:
-        shown = ln if len(ln) <= 160 else ln[:157] + "..."
-        print(f"    | {shown}")
-    if len(lines) > PREVIEW_LINES:
-        print(f"    | ... ({len(lines) - PREVIEW_LINES} more line(s))")
+    for ln in preview:
+        print(f"    | {clip(ln)}")
+    if total > PREVIEW_LINES:
+        print(f"    | ... ({total - PREVIEW_LINES:,} more line(s))")
+        print(f"  last line:   {clip(last_line)}")
 
     problems = []
-    if not raw:
+    notes = []
+    if size == 0:
         problems.append("file is empty")
-    if non_empty and "|" not in text:
+    if non_empty and not col_hist.get(2) and max(col_hist, default=1) == 1:
         problems.append("no pipe delimiters found")
-    if len(col_counts) > 1:
-        problems.append("rows do not all have the same number of columns")
+    if len(col_hist) > 1:
+        main_cols = max(col_hist, key=col_hist.get)
+        odd = {c: n for c, n in col_hist.items() if c != main_cols}
+        only_trailer = (sum(odd.values()) == 1 and last_cols != main_cols)
+        if only_trailer:
+            notes.append(f"the last line has {last_cols} columns instead of {main_cols}; "
+                         "this looks like a trailer record")
+        else:
+            problems.append(f"{sum(odd.values()):,} row(s) do not have the usual {main_cols} columns")
+            for c, n in sorted(odd.items()):
+                print(f"  rows with {c} columns ({n:,}); first examples:")
+                for lineno, ln in examples[c]:
+                    print(f"    line {lineno:,}: {clip(ln)}")
+    if decode_errors:
+        problems.append("some lines are not valid UTF-8")
+    for n in notes:
+        print(f"  note:        {n}")
     if problems:
         print("  checks:      " + "; ".join(problems))
         return False
@@ -441,6 +490,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Network timeout in seconds (default 30)")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Print the SSH negotiation (paramiko debug log) to stderr")
+    parser.add_argument("--inspect", nargs="+", type=Path, default=[], metavar="FILE",
+                        help="Only summarise these already-downloaded .psv files; do not connect")
+    parser.add_argument("--skip-existing", action="store_true",
+                        help="Do not re-download a file that already exists locally with the listed size")
     args = parser.parse_args(argv)
     if not args.host:
         parser.error("--host is required (or set SARS_SFTP_HOST)")
@@ -451,6 +504,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.inspect:
+        ok = True
+        for p in args.inspect:
+            if not p.is_file():
+                sys.exit(f"'{p}' is not a file.")
+            ok = summarise_psv(p) and ok
+        return 0 if ok else 1
     if args.verbose:
         import logging
         logging.basicConfig(stream=sys.stderr, level=logging.DEBUG,
@@ -492,7 +552,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         ensure_remote_dir(sftp, OUTBOUND_DIR)
-        downloaded = download_inbound(sftp, args.download_dir)
+        downloaded = download_inbound(sftp, args.download_dir, args.skip_existing)
         confirm_content(downloaded, args.yes)
         if args.no_retention:
             print("\nRetention step skipped (--no-retention).")
