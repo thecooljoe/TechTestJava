@@ -2,3 +2,5 @@ out/
 .idea/
 .DS_Store/
 TechTestJava2.iml
+downloads/
+__pycache__/
