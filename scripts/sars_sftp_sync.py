@@ -19,6 +19,7 @@ Examples:
   python3 sars_sftp_sync.py --host sftp-test.example.co.za
   python3 sars_sftp_sync.py --host sftp-test.example.co.za --port 2222 --dry-run
   python3 sars_sftp_sync.py --host sftp-test.example.co.za --upload UIF_2_20261014.psv
+  python3 sars_sftp_sync.py --host sftp-test.example.co.za --verbose   # debug a login problem
 """
 
 from __future__ import annotations
@@ -70,6 +71,21 @@ def prompt_credentials(username: str | None) -> tuple[str, str]:
     if not password:
         sys.exit("A password is required.")
     return username, password
+
+
+def probe_auth_methods(host: str, port: int, username: str, timeout: float) -> list[str]:
+    """Ask the server which authentication methods it accepts for this user."""
+    transport = paramiko.Transport((host, port))
+    try:
+        transport.banner_timeout = timeout
+        transport.start_client(timeout=timeout)
+        try:
+            transport.auth_none(username)
+        except paramiko.BadAuthenticationType as exc:
+            return list(exc.allowed_types)
+        return ["none"]
+    finally:
+        transport.close()
 
 
 def connect(host: str, port: int, username: str, password: str,
@@ -316,6 +332,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Reject hosts not present in known_hosts instead of warning")
     parser.add_argument("--timeout", type=float, default=30.0,
                         help="Network timeout in seconds (default 30)")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Print the SSH negotiation (paramiko debug log) to stderr")
     args = parser.parse_args(argv)
     if not args.host:
         args.host = input("SFTP host: ").strip()
@@ -328,6 +346,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.verbose:
+        import logging
+        logging.basicConfig(stream=sys.stderr, level=logging.DEBUG,
+                            format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+        logging.getLogger("paramiko").setLevel(logging.DEBUG)
     username, password = prompt_credentials(args.username)
 
     started = time.time()
@@ -335,7 +358,19 @@ def main(argv: list[str] | None = None) -> int:
         client, sftp = connect(args.host, args.port, username, password,
                                args.strict_host_key, args.timeout)
     except paramiko.AuthenticationException:
-        print("Authentication failed: check the username and password.", file=sys.stderr)
+        print("Authentication failed: the server rejected the username/password.", file=sys.stderr)
+        try:
+            allowed = probe_auth_methods(args.host, args.port, username, args.timeout)
+            print(f"Authentication methods the server accepts for '{username}': "
+                  f"{', '.join(allowed)}", file=sys.stderr)
+            if "password" not in allowed and "keyboard-interactive" not in allowed:
+                print("The server does not accept password logins for this user; "
+                      "it may expect an SSH key or a different username format.", file=sys.stderr)
+        except (paramiko.SSHException, OSError) as exc:
+            print(f"(Could not query accepted authentication methods: {exc})", file=sys.stderr)
+        print("Check: the exact username (including any domain prefix such as DOMAIN\\user), "
+              "the password (no trailing spaces), and that the account has been activated. "
+              "Re-run with --verbose to see the SSH negotiation.", file=sys.stderr)
         return 2
     except paramiko.ssh_exception.IncompatiblePeer as exc:
         print(f"Could not connect to {args.host}:{args.port}: {exc}", file=sys.stderr)
