@@ -55,6 +55,7 @@ EXPECTED_INBOUND_FILES = 2
 DEFAULT_RETENTION_DAYS = 31
 PREVIEW_LINES = 5
 CHUNK = 32 * 1024
+PREFETCH_LIMIT = 64 * 1024 * 1024  # pipeline reads only when the listed size is plausible
 
 
 @dataclass
@@ -228,7 +229,9 @@ def download_file(sftp: paramiko.SFTPClient, directory: str, f: RemoteFile, loca
     for remote_path in path_candidates(directory, f.name):
         try:
             with sftp.open(remote_path, "rb") as rf:
-                if f.size:
+                # Sizes reported by DataPower are unreliable; only pipeline reads for
+                # plausible sizes, otherwise read sequentially until EOF.
+                if f.size and f.size <= PREFETCH_LIMIT:
                     rf.prefetch(f.size)
                 with open(local_path, "wb") as lf:
                     shutil.copyfileobj(rf, lf, CHUNK)
@@ -265,9 +268,12 @@ def download_inbound(sftp: paramiko.SFTPClient, local_dir: Path) -> list[Path]:
         local_path = local_dir / f.name
         used = download_file(sftp, OUTBOUND_DIR, f, local_path)
         local_size = local_path.stat().st_size
+        note = ""
         if f.size is not None and local_size != f.size:
-            sys.exit(f"Download of {f.name} is incomplete ({local_size:,} of {f.size:,} bytes); aborting.")
-        print(f"  {f.name}: {local_size:,} B  OK  (via {used})")
+            note = f"  (server listed {f.size:,} B; DataPower sizes are often wrong, check the content below)"
+        print(f"  {f.name}: {local_size:,} B downloaded via {used}{note}")
+        if local_size == 0:
+            print(f"  WARNING: {f.name} came down empty.")
         downloaded.append(local_path)
     return downloaded
 
