@@ -22,20 +22,34 @@ If you already have a newer version installed, run `pip install 'paramiko>=3.4,<
 ## Usage
 
 ```bash
-# Interactive run (prompts for host, username and password)
+# Test environment (sftptest.sars.gov.za is the default host; prompts for username and password)
 python3 scripts/sars_sftp_sync.py
 
-# Typical run against the test environment
-python3 scripts/sars_sftp_sync.py --host <sars-test-host> --port 22
+# Production
+python3 scripts/sars_sftp_sync.py --host sftp.sars.gov.za
 
 # Preview the clean-up and upload without changing the server
-python3 scripts/sars_sftp_sync.py --host <sars-test-host> --dry-run --upload UIF_2_20261014.psv
+python3 scripts/sars_sftp_sync.py --dry-run --upload UIF_2_20261014.psv
 
 # Unattended run (no confirmation prompts)
-python3 scripts/sars_sftp_sync.py --host <sars-test-host> --username <user> --yes
+python3 scripts/sars_sftp_sync.py --username <user> --yes
 ```
 
 Host, port and username may also be given via `SARS_SFTP_HOST`, `SARS_SFTP_PORT` and
 `SARS_SFTP_USER`. The password is always prompted for and never read from arguments.
 Downloads go to `downloads/SARSOUTBOUND/` by default (`--download-dir` to change).
 Use `--strict-host-key` once the server's key is in `~/.ssh/known_hosts`.
+
+## Notes on the SARS server
+
+The SARS endpoint is an IBM DataPower appliance with limited SFTP support. The script:
+
+- tries relative, absolute and `./`-prefixed paths when opening a file, because DataPower
+  rejects some path forms (the OpenSSH `sftp` client's `get` after `cd` fails for this reason);
+- falls back to keyboard-interactive login if plain password login is rejected;
+- never deletes a file whose modification time the server does not report;
+- uploads straight to the final file name (no temporary name and rename), because DataPower
+  may process a file as soon as it is closed and may not support rename.
+
+If a login fails, the script prints the authentication methods the server accepts. Run with
+`--verbose` to see the full SSH negotiation.

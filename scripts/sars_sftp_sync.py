@@ -4,7 +4,7 @@ SARS SFTP exchange helper.
 
 What it does, in order:
   1. Prompts for a username and password and connects to the SARS test
-     environment over SFTP.
+     environment (sftptest.sars.gov.za) over SFTP.
   2. Looks in the ``SARSOUTBOUND`` sub-directory of the login root for ``.psv``
      files whose name starts with ``UIF_1_``, downloads them and prints a
      content summary (size, line count, column count per line, a preview) so
@@ -15,11 +15,17 @@ What it does, in order:
   4. Uploads any files given with ``--upload`` to the root directory, which is
      where files destined for SARS must be placed.
 
+The SARS endpoint is an IBM DataPower appliance, which is a limited SFTP
+server: it offers only the legacy ssh-rsa host key (hence paramiko < 4), may
+not support stat/realpath/rename, and may not report file timestamps. The
+script works around these where it can and never deletes a file whose age
+it cannot establish.
+
 Examples:
-  python3 sars_sftp_sync.py --host sftp-test.example.co.za
-  python3 sars_sftp_sync.py --host sftp-test.example.co.za --port 2222 --dry-run
-  python3 sars_sftp_sync.py --host sftp-test.example.co.za --upload UIF_2_20261014.psv
-  python3 sars_sftp_sync.py --host sftp-test.example.co.za --verbose   # debug a login problem
+  python3 sars_sftp_sync.py                                   # test environment
+  python3 sars_sftp_sync.py --host sftp.sars.gov.za           # production
+  python3 sars_sftp_sync.py --dry-run --upload UIF_2_20261014.psv
+  python3 sars_sftp_sync.py --verbose                         # debug a login problem
 """
 
 from __future__ import annotations
@@ -27,6 +33,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import os
+import shutil
 import stat
 import sys
 import time
@@ -40,23 +47,30 @@ except ImportError:  # pragma: no cover - guidance for the operator
     sys.exit("paramiko is required: pip install 'paramiko>=3.4,<4'")
 
 
+DEFAULT_HOST = "sftptest.sars.gov.za"
 OUTBOUND_DIR = "SARSOUTBOUND"
 INBOUND_PREFIX = "UIF_1_"
 INBOUND_SUFFIX = ".psv"
 EXPECTED_INBOUND_FILES = 2
 DEFAULT_RETENTION_DAYS = 31
 PREVIEW_LINES = 5
+CHUNK = 32 * 1024
 
 
 @dataclass
 class RemoteFile:
     name: str
-    size: int
-    mtime: datetime
+    size: int | None
+    mtime: datetime | None
 
     @property
-    def age(self) -> timedelta:
-        return datetime.now() - self.mtime
+    def age(self) -> timedelta | None:
+        return None if self.mtime is None else datetime.now() - self.mtime
+
+    def describe(self) -> str:
+        when = f"{self.mtime:%Y-%m-%d %H:%M}" if self.mtime else "unknown date   "
+        size = f"{self.size:>10,} B" if self.size is not None else "   unknown size"
+        return f"{when}  {size}  {self.name}"
 
 
 # --------------------------------------------------------------------------- #
@@ -71,6 +85,10 @@ def prompt_credentials(username: str | None) -> tuple[str, str]:
     if not password:
         sys.exit("A password is required.")
     return username, password
+
+
+def known_hosts_path() -> Path:
+    return Path.home() / ".ssh" / "known_hosts"
 
 
 def probe_auth_methods(host: str, port: int, username: str, timeout: float) -> list[str]:
@@ -88,67 +106,137 @@ def probe_auth_methods(host: str, port: int, username: str, timeout: float) -> l
         transport.close()
 
 
-def connect(host: str, port: int, username: str, password: str,
-            strict_host_key: bool, timeout: float) -> tuple[paramiko.SSHClient, paramiko.SFTPClient]:
-    client = paramiko.SSHClient()
-    client.load_system_host_keys()
-    known_hosts = Path.home() / ".ssh" / "known_hosts"
-    if known_hosts.exists():
+def _check_host_key(transport: paramiko.Transport, host: str, port: int, strict: bool) -> None:
+    key = transport.get_remote_server_key()
+    hostname = host if port == 22 else f"[{host}]:{port}"
+    keys = paramiko.HostKeys()
+    if known_hosts_path().exists():
         try:
-            client.load_host_keys(str(known_hosts))
+            keys.load(str(known_hosts_path()))
         except OSError:
             pass
-    if strict_host_key:
-        client.set_missing_host_key_policy(paramiko.RejectPolicy())
-    else:
-        client.set_missing_host_key_policy(paramiko.WarningPolicy())
+    if keys.check(hostname, key):
+        return
+    msg = f"Unknown {key.get_name()} host key for {hostname}: {key.get_fingerprint().hex()}"
+    if strict:
+        raise paramiko.SSHException(msg + " (rejected: --strict-host-key)")
+    print("WARNING: " + msg, file=sys.stderr)
+
+
+def connect_interactive(host: str, port: int, username: str, password: str,
+                        strict_host_key: bool, timeout: float
+                        ) -> tuple[paramiko.Transport, paramiko.SFTPClient]:
+    """Log in with SSH keyboard-interactive auth, answering every prompt with the password."""
+    transport = paramiko.Transport((host, port))
+    transport.banner_timeout = timeout
+    transport.start_client(timeout=timeout)
+    try:
+        _check_host_key(transport, host, port, strict_host_key)
+        transport.auth_interactive(
+            username, lambda title, instructions, prompts: [password] * len(prompts))
+        sftp = paramiko.SFTPClient.from_transport(transport)
+        if sftp is None:
+            raise paramiko.SSHException("server refused to open an SFTP session")
+        return transport, sftp
+    except Exception:
+        transport.close()
+        raise
+
+
+def connect(host: str, port: int, username: str, password: str,
+            strict_host_key: bool, timeout: float):
+    """Return (closeable, sftp). Tries normal password auth, then keyboard-interactive."""
+    client = paramiko.SSHClient()
+    client.load_system_host_keys()
+    if known_hosts_path().exists():
+        try:
+            client.load_host_keys(str(known_hosts_path()))
+        except OSError:
+            pass
+    policy = paramiko.RejectPolicy() if strict_host_key else paramiko.WarningPolicy()
+    client.set_missing_host_key_policy(policy)
 
     print(f"Connecting to {host}:{port} as {username} ...")
-    client.connect(
-        hostname=host,
-        port=port,
-        username=username,
-        password=password,
-        look_for_keys=False,
-        allow_agent=False,
-        timeout=timeout,
-        banner_timeout=timeout,
-        auth_timeout=timeout,
-    )
-    sftp = client.open_sftp()
+    try:
+        client.connect(hostname=host, port=port, username=username, password=password,
+                       look_for_keys=False, allow_agent=False, timeout=timeout,
+                       banner_timeout=timeout, auth_timeout=timeout)
+        sftp = client.open_sftp()
+        closeable = client
+    except paramiko.AuthenticationException:
+        client.close()
+        try:
+            allowed = probe_auth_methods(host, port, username, timeout)
+        except (paramiko.SSHException, OSError):
+            allowed = []
+        if "keyboard-interactive" not in allowed:
+            raise
+        print("Password authentication was rejected; retrying with keyboard-interactive ...")
+        closeable, sftp = connect_interactive(host, port, username, password,
+                                              strict_host_key, timeout)
+
     sftp.get_channel().settimeout(timeout)
-    root = sftp.normalize(".")
+    try:
+        root = sftp.normalize(".")
+    except OSError:
+        root = "(server does not report it)"
     print(f"Connected. Root directory: {root}")
-    return client, sftp
+    return closeable, sftp
 
 
 # --------------------------------------------------------------------------- #
-# Remote listing helpers
+# Remote helpers (tolerant of DataPower's partial SFTP support)
 # --------------------------------------------------------------------------- #
 def list_remote_files(sftp: paramiko.SFTPClient, directory: str) -> list[RemoteFile]:
     files: list[RemoteFile] = []
     for attr in sftp.listdir_attr(directory):
         if attr.st_mode is not None and stat.S_ISDIR(attr.st_mode):
             continue
-        files.append(RemoteFile(
-            name=attr.filename,
-            size=attr.st_size or 0,
-            mtime=datetime.fromtimestamp(attr.st_mtime or 0),
-        ))
+        if attr.filename in (".", ".."):
+            continue
+        mtime = datetime.fromtimestamp(attr.st_mtime) if attr.st_mtime else None
+        size = attr.st_size if attr.st_size is not None else None
+        files.append(RemoteFile(name=attr.filename, size=size, mtime=mtime))
     return sorted(files, key=lambda f: f.name)
 
 
-def remote_join(directory: str, name: str) -> str:
-    return f"{directory.rstrip('/')}/{name}"
+def path_candidates(directory: str, name: str) -> list[str]:
+    """DataPower is picky about path form; try relative, absolute and ./-prefixed."""
+    rel = f"{directory.rstrip('/')}/{name}" if directory not in ("", ".") else name
+    return [rel, "/" + rel, "./" + rel]
 
 
 def ensure_remote_dir(sftp: paramiko.SFTPClient, directory: str) -> None:
     try:
         st = sftp.stat(directory)
+        if st.st_mode is not None and not stat.S_ISDIR(st.st_mode):
+            sys.exit(f"Remote path '{directory}' exists but is not a directory.")
+        return
     except FileNotFoundError:
         sys.exit(f"Remote directory '{directory}' was not found in the root directory.")
-    if st.st_mode is None or not stat.S_ISDIR(st.st_mode):
-        sys.exit(f"Remote path '{directory}' exists but is not a directory.")
+    except OSError:
+        pass  # stat unsupported; fall back to listing
+    try:
+        sftp.listdir_attr(directory)
+    except OSError as exc:
+        sys.exit(f"Remote directory '{directory}' could not be read: {exc}")
+
+
+def download_file(sftp: paramiko.SFTPClient, directory: str, f: RemoteFile, local_path: Path) -> str:
+    """Download without relying on stat/realpath. Returns the remote path that worked."""
+    errors = []
+    for remote_path in path_candidates(directory, f.name):
+        try:
+            with sftp.open(remote_path, "rb") as rf:
+                if f.size:
+                    rf.prefetch(f.size)
+                with open(local_path, "wb") as lf:
+                    shutil.copyfileobj(rf, lf, CHUNK)
+            return remote_path
+        except OSError as exc:
+            errors.append(f"{remote_path}: {exc}")
+            local_path.unlink(missing_ok=True)
+    raise OSError("could not open the remote file under any path form:\n    " + "\n    ".join(errors))
 
 
 # --------------------------------------------------------------------------- #
@@ -160,7 +248,7 @@ def download_inbound(sftp: paramiko.SFTPClient, local_dir: Path) -> list[Path]:
 
     print(f"\n{OUTBOUND_DIR} contains {len(all_files)} file(s):")
     for f in all_files:
-        print(f"  {f.mtime:%Y-%m-%d %H:%M}  {f.size:>10,} B  {f.name}")
+        print("  " + f.describe())
 
     wanted = [f for f in all_files
               if f.name.startswith(INBOUND_PREFIX) and f.name.lower().endswith(INBOUND_SUFFIX)]
@@ -174,14 +262,12 @@ def download_inbound(sftp: paramiko.SFTPClient, local_dir: Path) -> list[Path]:
     downloaded: list[Path] = []
     print(f"\nDownloading {len(wanted)} file(s) to {local_dir.resolve()} ...")
     for f in wanted:
-        remote_path = remote_join(OUTBOUND_DIR, f.name)
         local_path = local_dir / f.name
-        sftp.get(remote_path, str(local_path))
+        used = download_file(sftp, OUTBOUND_DIR, f, local_path)
         local_size = local_path.stat().st_size
-        status = "OK" if local_size == f.size else f"SIZE MISMATCH (remote {f.size:,} B)"
-        print(f"  {f.name}: {local_size:,} B  {status}")
-        if local_size != f.size:
-            sys.exit(f"Download of {f.name} is incomplete; aborting.")
+        if f.size is not None and local_size != f.size:
+            sys.exit(f"Download of {f.name} is incomplete ({local_size:,} of {f.size:,} bytes); aborting.")
+        print(f"  {f.name}: {local_size:,} B  OK  (via {used})")
         downloaded.append(local_path)
     return downloaded
 
@@ -230,7 +316,7 @@ def summarise_psv(path: Path) -> bool:
 def confirm_content(paths: list[Path], assume_yes: bool) -> None:
     if not paths:
         return
-    all_ok = all(summarise_psv(p) for p in paths)
+    all_ok = all([summarise_psv(p) for p in paths])
     if assume_yes:
         print("\nContent review skipped (--yes).")
         return
@@ -248,10 +334,16 @@ def apply_retention(sftp: paramiko.SFTPClient, retention_days: int,
                     dry_run: bool, assume_yes: bool) -> None:
     cutoff = datetime.now() - timedelta(days=retention_days)
     files = list_remote_files(sftp, OUTBOUND_DIR)
-    stale = [f for f in files if f.mtime < cutoff]
+    undated = [f for f in files if f.mtime is None]
+    stale = [f for f in files if f.mtime is not None and f.mtime < cutoff]
 
     print(f"\nRetention: removing files in {OUTBOUND_DIR} older than {retention_days} days "
           f"(before {cutoff:%Y-%m-%d %H:%M}).")
+    if undated:
+        print(f"  NOTE: the server reports no modification time for {len(undated)} file(s); "
+              "they are left alone because their age cannot be established:")
+        for f in undated:
+            print(f"    {f.name}")
     if not stale:
         print("  Nothing to remove.")
         return
@@ -267,8 +359,16 @@ def apply_retention(sftp: paramiko.SFTPClient, retention_days: int,
             print("  Skipped deletion.")
             return
     for f in stale:
-        sftp.remove(remote_join(OUTBOUND_DIR, f.name))
-        print(f"  Deleted {f.name}")
+        last_error = None
+        for remote_path in path_candidates(OUTBOUND_DIR, f.name):
+            try:
+                sftp.remove(remote_path)
+                print(f"  Deleted {f.name}")
+                break
+            except OSError as exc:
+                last_error = exc
+        else:
+            print(f"  Could not delete {f.name}: {last_error}")
 
 
 # --------------------------------------------------------------------------- #
@@ -282,25 +382,25 @@ def upload_to_root(sftp: paramiko.SFTPClient, paths: list[Path], dry_run: bool) 
         if not p.is_file():
             sys.exit(f"Upload source '{p}' is not a file.")
         remote_name = p.name
+        local_size = p.stat().st_size
         if dry_run:
-            print(f"  Dry run: would upload {p} -> {remote_name}")
+            print(f"  Dry run: would upload {p} -> {remote_name} ({local_size:,} B)")
             continue
-        tmp_name = f".{remote_name}.part"
-        sftp.put(str(p), tmp_name)
-        remote_size = sftp.stat(tmp_name).st_size
-        if remote_size != p.stat().st_size:
-            sftp.remove(tmp_name)
-            sys.exit(f"Upload of {p.name} is incomplete ({remote_size} of {p.stat().st_size} bytes).")
+        # Write straight to the final name: DataPower may process a file as soon as it
+        # is closed and may not support rename, so a temporary name is not safe here.
+        with open(p, "rb") as lf, sftp.open(remote_name, "wb") as rf:
+            shutil.copyfileobj(lf, rf, CHUNK)
+        remote_size = None
         try:
-            sftp.posix_rename(tmp_name, remote_name)
+            remote_size = next((f.size for f in list_remote_files(sftp, ".") if f.name == remote_name), None)
         except OSError:
-            # Server without POSIX rename: fall back to remove + rename.
-            try:
-                sftp.remove(remote_name)
-            except FileNotFoundError:
-                pass
-            sftp.rename(tmp_name, remote_name)
-        print(f"  {p.name}: {remote_size:,} B uploaded")
+            pass
+        if remote_size is None:
+            print(f"  {p.name}: {local_size:,} B uploaded (server does not report size for verification)")
+        elif remote_size != local_size:
+            sys.exit(f"Upload of {p.name} looks incomplete ({remote_size:,} of {local_size:,} bytes).")
+        else:
+            print(f"  {p.name}: {local_size:,} B uploaded and verified")
 
 
 # --------------------------------------------------------------------------- #
@@ -310,8 +410,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__.split("Examples:")[1] if "Examples:" in __doc__ else None,
     )
-    parser.add_argument("--host", default=os.environ.get("SARS_SFTP_HOST"),
-                        help="SFTP host of the SARS test environment (or env SARS_SFTP_HOST)")
+    parser.add_argument("--host", default=os.environ.get("SARS_SFTP_HOST", DEFAULT_HOST),
+                        help=f"SFTP host (default {DEFAULT_HOST}, the test environment; "
+                             "production is sftp.sars.gov.za; or env SARS_SFTP_HOST)")
     parser.add_argument("--port", type=int, default=int(os.environ.get("SARS_SFTP_PORT", "22")),
                         help="SFTP port (default 22, or env SARS_SFTP_PORT)")
     parser.add_argument("--username", default=os.environ.get("SARS_SFTP_USER"),
@@ -336,8 +437,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Print the SSH negotiation (paramiko debug log) to stderr")
     args = parser.parse_args(argv)
     if not args.host:
-        args.host = input("SFTP host: ").strip()
-    if not args.host:
         parser.error("--host is required (or set SARS_SFTP_HOST)")
     if args.retention_days < 1:
         parser.error("--retention-days must be at least 1")
@@ -355,8 +454,8 @@ def main(argv: list[str] | None = None) -> int:
 
     started = time.time()
     try:
-        client, sftp = connect(args.host, args.port, username, password,
-                               args.strict_host_key, args.timeout)
+        closeable, sftp = connect(args.host, args.port, username, password,
+                                  args.strict_host_key, args.timeout)
     except paramiko.AuthenticationException:
         print("Authentication failed: the server rejected the username/password.", file=sys.stderr)
         try:
@@ -376,7 +475,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Could not connect to {args.host}:{args.port}: {exc}", file=sys.stderr)
         print("The server only offers SSH algorithms that this paramiko version "
               f"({paramiko.__version__}) does not support. paramiko 4 and later dropped the "
-              "legacy ssh-rsa (SHA-1) and ssh-dss host keys that the SARS server uses.\n"
+              "legacy ssh-rsa (SHA-1) host key that the SARS server uses.\n"
               "Fix: pip install 'paramiko>=3.4,<4'", file=sys.stderr)
         return 2
     except (paramiko.SSHException, OSError) as exc:
@@ -399,7 +498,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     finally:
         sftp.close()
-        client.close()
+        closeable.close()
 
     print(f"\nDone in {time.time() - started:.1f}s.")
     return 0
